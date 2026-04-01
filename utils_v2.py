@@ -836,11 +836,21 @@ def cba_fgw_incent(
 
     C_total = C_feat + beta * C_cba_static        # combined linear cost
 
+    N_exp = len(np.asarray(p_a, dtype=np.float64))
+    M_exp = len(np.asarray(q_a, dtype=np.float64))
+
     if G0 is None:
         G = p_a[:, None] * q_a[None, :]           # outer product initialisation
     else:
-        G = nx.from_numpy(np.asarray(G0, dtype=np.float64))
-        G = G / nx.sum(G)
+        G0_arr = np.asarray(G0, dtype=np.float64)
+        if G0_arr.shape != (N_exp, M_exp):
+            # Warm-start has wrong shape (e.g. stripped plan passed after dummy
+            # augmentation). Reset to the outer-product default to avoid the
+            # ValueError: operands could not be broadcast together.
+            G = p_a[:, None] * q_a[None, :]
+        else:
+            row_sum = G0_arr.sum()
+            G = nx.from_numpy(G0_arr / (row_sum + 1e-12))
 
     if isinstance(nx, ot.backend.TorchBackend):
         C_total = nx.from_numpy(C_total.astype(np.float32) if use_gpu

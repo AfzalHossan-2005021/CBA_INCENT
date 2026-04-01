@@ -392,7 +392,13 @@ def _run_ct_alternating_loop(
     R, t      = R_init.copy(), t_init.copy()
     tps_field = TPSDeformationField(smoothing=tps_smoothing,
                                      n_control_points=tps_n_control)
-    pi        = None
+    # Keep two plan variables:
+    #   pi_warmstart — augmented (ns_aug, nt_aug), used as G0 for next FW call
+    #   pi_real      — stripped (ns, nt), used for Procrustes, barycenters, output
+    pi_warmstart = None
+    pi_real      = None
+    death_mass_out = 0.0
+    birth_mass_out = 0.0
     loss_history: list = []
 
     for outer in range(max_outer_iters):
@@ -410,7 +416,7 @@ def _run_ct_alternating_loop(
         else:
             C_static_full[:ns, :nt] = cba_static_cost(X_s, X_t, R, t)
 
-        # ── Block A: transport solve ───────────────────────────────────────
+        # ── Block A: transport solve (G0 = augmented warm-start) ──────────
         pi_aug, inner_log = cba_fgw_incent(
             C_feat       = C_feat_aug,
             C_cba_static = C_static_full,
@@ -421,7 +427,7 @@ def _run_ct_alternating_loop(
             beta         = beta_cba,
             alpha_gw     = alpha_gw,
             gamma_quad   = gamma_quad,
-            G0           = pi,
+            G0           = pi_warmstart,   # augmented (ns_aug, nt_aug) or None
             numItermax   = inner_iters,
             tol_rel      = 1e-7,
             tol_abs      = 1e-9,
@@ -431,11 +437,19 @@ def _run_ct_alternating_loop(
         )
         loss_history.extend(inner_log['loss'])
 
+        # Keep augmented plan for next warm-start (correct shape)
+        pi_warmstart = pi_aug
+
+        # Birth/death mass before stripping
+        death_mass_out = float(pi_aug[:ns, -1].sum()) if nt_aug > nt else 0.0
+        birth_mass_out = float(pi_aug[-1, :nt].sum()) if ns_aug > ns else 0.0
+
         # Strip dummy rows/cols → real (ns, nt) plan
-        pi_real = pi_aug[:ns, :nt].copy()
-        pi_sum  = pi_real.sum()
+        pi_stripped = pi_aug[:ns, :nt].copy()
+        pi_sum = pi_stripped.sum()
         if pi_sum > 0:
-            pi_real /= pi_sum
+            pi_stripped /= pi_sum
+        pi_real = pi_stripped
 
         # ── Compute barycenters ────────────────────────────────────────────
         weights     = pi_real.sum(axis=1)
@@ -448,7 +462,6 @@ def _run_ct_alternating_loop(
 
         if n_matched < 4:
             warnings.warn("Fewer than 4 matched cells; stopping alternating loop.")
-            pi = pi_real
             break
 
         # ── Block B: update transform (Procrustes or TPS) ─────────────────
@@ -470,13 +483,10 @@ def _run_ct_alternating_loop(
                 lf.write(f"CT outer {outer+1} [rigid]: n_matched={n_matched}, "
                          f"ΔR={delta_R:.2e}, Δt={delta_t:.2e}\n")
 
-            pi = pi_real
-
             # Transition to TPS phase when rigid has converged
             if delta_R < tol_procrustes and delta_t < tol_procrustes:
                 if verbose:
                     print(f"[CT-loop] Rigid converged; switching to TPS phase.")
-                # Fit initial TPS on current confident pairs
                 tps_field.fit(X_s, barycenters, weights, verbose=verbose)
                 with open(log_path, 'a') as lf:
                     lf.write(f"  TPS phase started at outer {outer+1}\n")
@@ -490,9 +500,9 @@ def _run_ct_alternating_loop(
             with open(log_path, 'a') as lf:
                 lf.write(f"CT outer {outer+1} [TPS]: n_matched={n_matched}, "
                          f"TPS-RMSE={tps_rmse:.4f}\n")
-            pi = pi_real
 
-    return pi, R, t, tps_field, loss_history
+    # Return stripped real plan; birth/death masses tracked separately
+    return pi_real, R, t, tps_field, loss_history, death_mass_out, birth_mass_out
 
 
 def _build_feature_cost(
@@ -1095,7 +1105,7 @@ def coherent_pairwise_align(
 
     if mode == 'cross_timepoint':
         # Full cross-timepoint loop: rigid phase → TPS phase
-        pi, R, t, tps_field, loss_history = _run_ct_alternating_loop(
+        pi, R, t, tps_field, loss_history, death_mass, birth_mass = _run_ct_alternating_loop(
             C_feat_aug    = C_feat_aug,
             D_A_aug       = D_A_aug,
             D_B_aug       = D_B_aug,
@@ -1125,14 +1135,15 @@ def coherent_pairwise_align(
             log_path         = log_path,
             **kwargs,
         )
-        # Compute birth/death mass from the augmented plan column/row
-        death_mass = float(pi.sum(axis=0)[-1]) if nt_aug > nt else 0.0
-        birth_mass = float(pi.sum(axis=1)[-1]) if ns_aug > ns else 0.0
-        # pi is already stripped to (ns, nt) by the CT loop
+        # death_mass and birth_mass are now returned directly from _run_ct_alternating_loop
 
     else:
         # Same-timepoint: rigid alternating loop
-        pi = None
+        # Keep two variables:
+        #   pi_warmstart — augmented (ns_aug, nt_aug), used as G0 for next FW call
+        #   pi_real      — stripped (ns, nt), used for Procrustes and output
+        pi_warmstart = None
+        pi_real      = None
         for outer in range(max_outer_iters):
             if verbose:
                 print(f"\n[CBA-FGW] Outer iter {outer+1}/{max_outer_iters} — "
@@ -1151,7 +1162,7 @@ def coherent_pairwise_align(
                 beta         = beta_cba,
                 alpha_gw     = alpha_gw,
                 gamma_quad   = gamma_quad,
-                G0           = pi,
+                G0           = pi_warmstart,   # augmented warm-start (correct shape)
                 numItermax   = inner_iters,
                 tol_rel      = 1e-7,
                 tol_abs      = 1e-9,
@@ -1161,6 +1172,10 @@ def coherent_pairwise_align(
             )
             loss_history.extend(inner_log['loss'])
 
+            # Save augmented plan for next warm-start BEFORE stripping
+            pi_warmstart = pi_aug
+
+            # Strip dummy rows/cols for Procrustes and output
             pi_real, death_mass, birth_mass = _strip_dummy(
                 pi_aug, ns, nt, has_dummy_src, has_dummy_tgt)
 
@@ -1170,7 +1185,7 @@ def coherent_pairwise_align(
             n_matched   = matched.sum()
 
             if n_matched < 3:
-                pi = pi_real; break
+                break
 
             if verbose:
                 rmse = compute_cba_rmse(pi_real, X_s, X_t, R, t, delta_threshold)
@@ -1182,7 +1197,6 @@ def coherent_pairwise_align(
             delta_R = np.linalg.norm(R_new - R, 'fro')
             delta_t = np.linalg.norm(t_new - t)
             R, t = R_new, t_new
-            pi   = pi_real
 
             if verbose:
                 print(f"[CBA-FGW]   ΔR={delta_R:.2e}, Δt={delta_t:.2e}")
@@ -1195,29 +1209,51 @@ def coherent_pairwise_align(
                     print(f"[CBA-FGW] Converged at outer iter {outer+1}.")
                 break
 
+        # Use stripped plan as final output
+        pi = pi_real if pi_real is not None else np.zeros((ns, nt), dtype=np.float64)
+
     # ── 10. Reverse transport plan ───────────────────────────────────────────
     if verbose:
         print("\n[CBA-FGW] Computing reverse transport plan …")
 
+    # Reverse CBA static cost
     if mode == 'cross_timepoint' and tps_field is not None and not tps_field._is_rigid:
-        # Reverse TPS cost: apply φ^{-1} ≈ φ fitted on swapped pairs
-        C_cba_rev = tps_field.static_cba_cost(X_t, X_s)    # (M, N) approx
+        C_cba_rev = tps_field.static_cba_cost(X_t, X_s)    # (nt, ns)
     else:
-        R_rev = R.T
-        t_rev = -R.T @ t
-        C_cba_rev = cba_static_cost(X_t, X_s, R_rev, t_rev)   # (M, N)
+        C_cba_rev = cba_static_cost(X_t, X_s, R.T, -R.T @ t)   # (nt, ns)
 
-    C_feat_rev = C_feat.T    # (M, N)
-    pad_r = (0, 1 if has_dummy_tgt else 0)
-    pad_c = (0, 1 if has_dummy_src else 0)
+    # Build properly augmented reverse costs.
+    # IMPORTANT: np.pad with default zeros gives dummy rows/cols a cost of 0,
+    # which causes the solver to trivially route all mass to the dummy.
+    # Instead, dummy entries must carry a high penalty (2× max real cost).
+    use_dummy = dummy_cell or mode == 'cross_timepoint'
+    cost_max  = max(float(C_feat.max()), 1e-6) * 2.0 + 1e-6
+
+    if use_dummy:
+        C_feat_rev_aug = np.full((nt_aug, ns_aug), cost_max, dtype=np.float64)
+        C_feat_rev_aug[:nt, :ns] = C_feat.T
+        if has_dummy_src and has_dummy_tgt:
+            C_feat_rev_aug[-1, -1] = cost_max   # dummy ↔ dummy is free (relative)
+
+        C_cba_rev_aug = np.zeros((nt_aug, ns_aug), dtype=np.float64)
+        C_cba_rev_aug[:nt, :ns] = C_cba_rev
+        # Dummy row/col stays 0 in the CBA cost (invisible to structure term)
+
+        p_rev = q_vals   # target becomes source in reverse
+        q_rev = p_vals   # source becomes target in reverse
+    else:
+        C_feat_rev_aug = C_feat.T
+        C_cba_rev_aug  = C_cba_rev
+        p_rev = np.ones(nt, dtype=np.float64) / nt
+        q_rev = np.ones(ns, dtype=np.float64) / ns
 
     pi_rev_aug, _ = cba_fgw_incent(
-        C_feat       = np.pad(C_feat_rev, (pad_r, pad_c)) if dummy_cell or mode == 'cross_timepoint' else C_feat_rev,
-        C_cba_static = np.pad(C_cba_rev,  (pad_r, pad_c)) if dummy_cell or mode == 'cross_timepoint' else C_cba_rev,
-        D_s          = D_B_aug if (dummy_cell or mode == 'cross_timepoint') else D_B,
-        D_t          = D_A_local_aug if (dummy_cell or mode == 'cross_timepoint') else D_A_local,
-        p            = q_vals if (dummy_cell or mode == 'cross_timepoint') else np.ones(nt) / nt,
-        q            = p_vals if (dummy_cell or mode == 'cross_timepoint') else np.ones(ns) / ns,
+        C_feat       = C_feat_rev_aug,
+        C_cba_static = C_cba_rev_aug,
+        D_s          = D_B_aug    if use_dummy else D_B,
+        D_t          = D_A_local_aug if use_dummy else D_A_local,
+        p            = p_rev,
+        q            = q_rev,
         beta         = beta_cba,
         alpha_gw     = alpha_gw,
         gamma_quad   = gamma_quad,
@@ -1226,7 +1262,7 @@ def coherent_pairwise_align(
         log          = True,
         numItermaxEmd = kwargs.get('numItermaxEmd', 500_000),
     )
-    if dummy_cell or mode == 'cross_timepoint':
+    if use_dummy:
         pi_rev, _, _ = _strip_dummy(pi_rev_aug, nt, ns, has_dummy_tgt, has_dummy_src)
     else:
         pi_rev = pi_rev_aug
@@ -1326,3 +1362,4 @@ def coherent_pairwise_align(
     if return_result:
         return result
     return pi
+
